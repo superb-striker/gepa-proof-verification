@@ -1,0 +1,6 @@
+google-generativeai 
+openai 
+groq 
+google-genai
+python-dotenv
+dspy
