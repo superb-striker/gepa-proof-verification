@@ -38,7 +38,31 @@ BASE_PROMPTS = {
             "$(1+x)^r - rx \\ge C$. "
             "End your response EXACTLY with 'The answer is C = Value'."
         )
-    }
+    },
+    #  Held-out test inequalities (never seen during optimization)
+    "triangle": {
+        "type": "relation",
+        "ground_truth": "(B) \\le",
+        "prompt": (
+            "Let $a, b$ be real numbers. Consider the following expression: "
+            "$|a + b| \\text{ [blank] } |a| + |b|$. "
+            "Determine the correct inequality relation to fill in the blank. "
+            "Options: (A) $<$, (B) $\\le$, (C) $=$, (D) $\\ge$, (E) $>$. "
+            "End your response EXACTLY with 'The answer is (Letter) Symbol'."
+        )
+    },
+    "jensens": {
+        "type": "relation",
+        "ground_truth": "(D) \\ge",
+        "prompt": (
+            "Let $f$ be a convex function on $\\mathbb{R}$, let $x_1, x_2 \\in \\mathbb{R}$, "
+            "and let $t \\in [0, 1]$. Consider the following expression: "
+            "$t f(x_1) + (1-t) f(x_2) \\text{ [blank] } f(t x_1 + (1-t) x_2)$. "
+            "Determine the correct inequality relation to fill in the blank. "
+            "Options: (A) $<$, (B) $\\le$, (C) $=$, (D) $\\ge$, (E) $>$. "
+            "End your response EXACTLY with 'The answer is (Letter) Symbol'."
+        )
+    },
 }
 
 # PHASE 2: GENERATING THE DATASET (Good & Flawed Instructions)
@@ -103,8 +127,6 @@ def generate_proof(inequality_id, base_data, config):
 
 def main():
     dataset = []
-    # Ensure data directory exists
-    os.makedirs("../artifacts/data_curated", exist_ok=True)
     # Loop through both inequalities and all instruction sets
     for ineq_id, base_data in BASE_PROMPTS.items():
         for config in INSTRUCTIONS:
@@ -113,10 +135,16 @@ def main():
             # Sleep briefly to avoid hitting API rate limits
             time.sleep(3)
     # Save to raw_proofs.json
+    output_dir = os.path.join("artifacts", "data_curated")
+    os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join("artifacts/data_curated", "raw_proofs.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(dataset, f, indent=4, ensure_ascii=False)
+    n_train = sum(1 for d in dataset if d["inequality"] in ("cauchy_schwarz", "bernoulli"))
+    n_test = sum(1 for d in dataset if d["inequality"] in ("triangle", "jensens"))
     print(f"\n Dataset generation complete! Saved {len(dataset)} proofs to {output_path}")
+    print(f"   ({n_train} train examples: cauchy_schwarz, bernoulli)")
+    print(f"   ({n_test} held-out test examples: triangle, jensens - never used for optimization)")
 
 if __name__ == "__main__":
     main()
