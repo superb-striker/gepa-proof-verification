@@ -1,132 +1,173 @@
+"""
+Optimizes all five judges (final-answer + four flaw judges) using BOTH GEPA
+and BootstrapFewShot. Both compiled variants are saved so evaluator.py can
+score them separately against the same held-out test set.
+
+Why GEPA over BootstrapFewShot, in principle: BootstrapFewShot only selects
+which successful traces to inject as few-shot demonstrations - it never
+rewrites the judge's instructions. GEPA runs a reflection LM over rollouts
+and proposes revised natural-language instructions for the signature itself.
+Given the task here is "does this proof exhibit flaw X" - a judgment call
+that hinges on how precisely the flaw is defined in the prompt, not just on
+pattern-matching to examples - instruction refinement is the more relevant
+lever. Running both and reporting both is what actually substantiates that
+claim instead of just asserting it.
+"""
+
 import json
 import os
 
 import dspy
 from dotenv import load_dotenv
-from dspy.teleprompt import BootstrapFewShot
+from dspy.teleprompt import GEPA, BootstrapFewShot
 
-# Import our uncompiled modules
+from data_utils import (
+    load_raw_dataset,
+    split_dataset,
+    to_dspy_examples,
+    train_val_split,
+)
 from dspy_modules import (
     ApproximationJudge,
     ComputationJudge,
+    FinalAnswerJudge,
     LogicalGapJudge,
     ToyCaseJudge,
 )
 
-# Load environment variables
 load_dotenv()
+gemini_key = os.getenv("GEMINI_API_KEY")
 nim_key = os.getenv("NVIDIA_API_KEY")
 
+if not gemini_key:
+    raise ValueError("GEMINI_API_KEY not found. Please check your .env file.")
 if not nim_key:
     raise ValueError("NVIDIA_API_KEY not found. Please check your .env file.")
 
-nim_lm = dspy.LM(
-    model='openai/meta/llama-3.1-70b-instruct',
+task_lm = dspy.LM(
+    model=os.getenv("TASK_MODEL", "openai/meta/llama-3.1-70b-instruct"),
     api_key=nim_key,
-    api_base='https://integrate.api.nvidia.com/v1'
+    api_base="https://integrate.api.nvidia.com/v1",
 )
 
-dspy.settings.configure(lm=nim_lm)
+# GEPA's own guidance is to use a distinct (often stronger) reflection model than the task LM being optimized, 
+# so the critique step isn't bottlenecked by the same model/quota it's trying to improve.
+reflection_lm = dspy.LM(
+    model=os.getenv("REFLECTION_MODEL", "gemini/gemini-2.5-flash"),
+    api_key=gemini_key,
+)
 
-# DATA PREPARATION
+dspy.settings.configure(lm=task_lm)
 
-def load_and_format_dataset(filepath="artifacts\\data_curated\\raw_proofs.json"):
-    """Loads the raw JSON and converts it into DSPy Examples."""
-    with open(filepath, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
-    dataset = []
-    for data in raw_data:
-        # Determine the expected boolean answers based on the flaw_type
-        flaw = data["flaw_type"]
-        # Create a dspy.Example. 
-        # We include the inputs (problem, proof) and the expected outputs.
-        example = dspy.Example(
-            problem=data["prompt_used"],
-            proof=data["generated_proof"],
-            uses_toy_case=(flaw == "toy_case"),
-            has_logical_gap=(flaw == "logical_gap"),
-            uses_illegal_approximation=(flaw == "approximation"),
-            has_computation_error=(flaw == "computation_error")
-        ).with_inputs("problem", "proof")
-        dataset.append(example)
-    return dataset
+# name -> (module class, target output field, input fields the module's forward() needs)
+JUDGES = {
+    "final_answer_judge": (FinalAnswerJudge, "is_equivalent", ("problem", "proof", "ground_truth")),
+    "toy_case_judge": (ToyCaseJudge, "uses_toy_case", ("problem", "proof")),
+    "logical_gap_judge": (LogicalGapJudge, "has_logical_gap", ("problem", "proof")),
+    "approximation_judge": (ApproximationJudge, "uses_illegal_approximation", ("problem", "proof")),
+    "computation_judge": (ComputationJudge, "has_computation_error", ("problem", "proof")),
+}
 
-# DSPy needs a metric function to know if a bootstrapped example is "Good" or "Bad".
-# We define simple exact-match metrics for our booleans.
 
-def toy_case_metric(example, pred, trace=None):
-    return example.uses_toy_case == pred.uses_toy_case
+def make_gepa_metric(field_name):
+    """
+    GEPA feedback metric for one judge's output field. 
+    Returns a Prediction with `score` and `feedback` (not a bare bool)
+    GEPA's reflection step reads the feedback text to decide how to revise instructions,
+    so a plain 0/1 signal throws away the information GEPA is designed to use.
+    """
+    def metric(gold, pred, trace=None, pred_name=None, pred_trace=None, program_trace=None):
+        expected = getattr(gold, field_name)
+        actual = getattr(pred, field_name, None)
+        correct = expected == actual
+        reasoning = getattr(pred, "reasoning", getattr(pred, "assessment_reasoning", "(no reasoning captured)"))
+        feedback = (
+            f"Expected {field_name}={expected}, judge predicted {actual}. "
+            f"Judge's stated reasoning: {reasoning}"
+        )
+        return dspy.Prediction(score=1.0 if correct else 0.0, feedback=feedback)
+    return metric
 
-def logical_gap_metric(example, pred, trace=None):
-    return example.has_logical_gap == pred.has_logical_gap
 
-def approximation_metric(example, pred, trace=None):
-    return example.uses_illegal_approximation == pred.uses_illegal_approximation
+def make_plain_metric(field_name):
+    """Boolean-only metric for BootstrapFewShot, which doesn't consume feedback text."""
+    def metric(example, pred, trace=None):
+        return getattr(example, field_name) == getattr(pred, field_name, None)
+    return metric
 
-def computation_metric(example, pred, trace=None):
-    return example.has_computation_error == pred.has_computation_error
 
-# COMPILATION / OPTIMIZATION
+def run_gepa(judge_cls, field_name, gepa_train, gepa_val):
+    student = judge_cls()
+    optimizer = GEPA(
+        metric=make_gepa_metric(field_name),
+        reflection_lm=reflection_lm,
+        auto="light",  # small budget appropriate to this dataset's size
+        num_threads=1,
+    )
+    return optimizer.compile(student, trainset=gepa_train, valset=gepa_val)
+
+
+def run_bootstrap(judge_cls, field_name, gepa_train, gepa_val):
+    student = judge_cls()
+    teleprompter = BootstrapFewShot(
+        metric=make_plain_metric(field_name),
+        max_bootstrapped_demos=3,
+        max_labeled_demos=1,
+    )
+    return teleprompter.compile(student, trainset=gepa_train + gepa_val)
+
+
 def optimize_judges():
     print("Loading dataset...")
-    trainset = load_and_format_dataset()
-    # Initialize the DSPy Optimizer
-    # max_bootstrapped_demos: How many successful reasoning chains to inject into the prompt
-    # max_labeled_demos: How many static examples to include
-    teleprompter = BootstrapFewShot(
-        metric=None, # We will override this per judge
-        max_bootstrapped_demos=3,
-        max_labeled_demos=1
-    )
-    os.makedirs(os.path.join("artifacts", "compiled_judges"), exist_ok=True)
-    # 1. Optimize Toy Case Judge
-    print("\n Compiling Toy Case Judge ")
-    teleprompter.metric = toy_case_metric
-    compiled_toy_judge = teleprompter.compile(ToyCaseJudge(), trainset=trainset)
-    compiled_toy_judge.save(os.path.join("artifacts", "compiled_judges", "toy_case_judge.json"))
-    
-    # 2. Optimize Logical Gap Judge
-    print("\n Compiling Logical Gap Judge ")
-    teleprompter.metric = logical_gap_metric
-    compiled_gap_judge = teleprompter.compile(LogicalGapJudge(), trainset=trainset)
-    compiled_gap_judge.save(os.path.join("artifacts", "compiled_judges", "logical_gap_judge.json"))
-    
-    # 3. Optimize Approximation Judge
-    print("\n Compiling Approximation Judge ")
-    teleprompter.metric = approximation_metric
-    compiled_approx_judge = teleprompter.compile(ApproximationJudge(), trainset=trainset)
-    compiled_approx_judge.save(os.path.join("artifacts", "compiled_judges", "approximation_judge.json"))
-    
-    # 4. Optimize Computation Judge
-    print("\n Compiling Computation Judge ")
-    teleprompter.metric = computation_metric
-    compiled_comp_judge = teleprompter.compile(ComputationJudge(), trainset=trainset)
-    compiled_comp_judge.save(os.path.join("artifacts", "compiled_judges", "computation_judge.json"))
-    
-    print("\nAll judges successfully optimized and saved to 'artifacts/compiled_judges/'!")
-    
-    # Inspect one of the generated prompts
-    print("\nExample Optimized Prompt for Toy Case Judge:")
-    print(nim_lm.history[-1])
+    raw = load_raw_dataset()
+    train_raw, test_raw = split_dataset(raw)
+    print(f"Train inequalities (used for optimization): "
+          f"{sorted({d['inequality'] for d in train_raw})} ({len(train_raw)} examples)")
+    print(f"Held-out test inequalities (never optimized on): "
+          f"{sorted({d['inequality'] for d in test_raw})} ({len(test_raw)} examples)")
 
-    print("\nSaving compiled prompt evidence...")
-    evidence_path = os.path.join("artifacts/evaluation_results", "compiled_prompts.txt")
-    
-    with open(evidence_path, "w", encoding="utf-8") as f:
-        f.write("DSPy OPTIMIZED PROMPT EVIDENCE\n")
-        f.write("This file contains the raw, compiled prompts generated by BootstrapFewShot.\n")
-        f.write("Notice the injected <Reasoning> steps and Few-Shot examples.\n\n")
-        # We grab the last 4 interactions from the LM's history
-        for i, interaction in enumerate(nim_lm.history[-4:]):
-            f.write(f" COMPILED PROMPT TRACE {i+1} \n\n")
-            # Extract the raw prompt text sent to the API
-            if isinstance(interaction, dict):
-                prompt_text = interaction.get('prompt') or interaction.get('messages') or str(interaction)
-                f.write(str(prompt_text))
-            else:
-                f.write(str(interaction))
-            f.write("\n\n" + "="*80 + "\n\n")
-    print(f"Evidence saved to '{evidence_path}'! Include this in your submission.")
+    gepa_train_raw, gepa_val_raw = train_val_split(train_raw)
+
+    os.makedirs(os.path.join("artifacts", "compiled_judges"), exist_ok=True)
+    run_log = {"judges": {}}
+
+    for name, (judge_cls, field_name, input_fields) in JUDGES.items():
+        print(f"\n Compiling {name} (fields: {input_fields}) ")
+        gepa_train = to_dspy_examples(gepa_train_raw, input_fields=input_fields)
+        gepa_val = to_dspy_examples(gepa_val_raw, input_fields=input_fields)
+
+        run_log["judges"][name] = {}
+
+        # GEPA 
+        try:
+            compiled_gepa = run_gepa(judge_cls, field_name, gepa_train, gepa_val)
+            out_path = os.path.join("artifacts", "compiled_judges", f"{name}_gepa.json")
+            compiled_gepa.save(out_path)
+            run_log["judges"][name]["gepa"] = "ok"
+            print(f"  GEPA: saved -> {out_path}")
+        except Exception as e:
+            run_log["judges"][name]["gepa"] = f"failed: {e}"
+            print(f"GEPA failed for {name}: {e}")
+
+        # BootstrapFewShot (always run, for a real comparison, not just a fallback) 
+        try:
+            compiled_bootstrap = run_bootstrap(judge_cls, field_name, gepa_train, gepa_val)
+            out_path = os.path.join("artifacts", "compiled_judges", f"{name}_bootstrap.json")
+            compiled_bootstrap.save(out_path)
+            run_log["judges"][name]["bootstrap"] = "ok"
+            print(f"  BootstrapFewShot: saved -> {out_path}")
+        except Exception as e:
+            run_log["judges"][name]["bootstrap"] = f"failed: {e}"
+            print(f"BootstrapFewShot failed for {name}: {e}")
+
+    log_path = os.path.join("artifacts", "evaluation_results", "optimizer_run_log.json")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(run_log, f, indent=2)
+
+    print(f"\nCompilation complete. Run log saved to {log_path}")
+    return run_log
+
 
 if __name__ == "__main__":
     optimize_judges()
